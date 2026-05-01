@@ -1,33 +1,37 @@
 """
 OMOP MCP tool server.
 
-Exposes three tools over MCP:
+Exposes four tools over MCP (Streamable HTTP transport):
 
-  - run_omop_sql       Read-only SELECT against the OMOP CDM.
+  - run_omop_sql       Read-only SELECT against the OMOP CDM (Postgres).
   - lookup_concept     Fuzzy concept search across the OMOP vocabulary.
   - expand_concept_set concept_ancestor descendant expansion.
+  - render_chart       Render a matplotlib chart from data and return as
+                       inline image content for the agent to embed.
 
-Connection is via DATABASE_URL (Postgres connection string). The pool is
-sized small intentionally — RAM agents are short-lived and Supabase's
-transaction pooler does the heavy lifting.
+Connection is via DATABASE_URL. The pool is sized small intentionally —
+RAM agents are short-lived and Supabase's transaction pooler does the
+heavy lifting.
 
 The read-only guard rejects any SQL containing mutation keywords before
 sending it to the database.
-
-Speaks MCP over Streamable HTTP on PORT (default 8000) at BASE_PATH
-(default /mcp). RAM's Container MCP template connects to this endpoint.
 """
 from __future__ import annotations
+import io
 import os
 import re
 import sys
-from typing import Any
+from typing import Any, Literal
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from mcp.server.fastmcp import FastMCP
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from mcp.server.fastmcp import FastMCP, Image
 
 
 # ─── Config ──────────────────────────────────────────────────────
@@ -40,8 +44,6 @@ PORT      = int(os.environ.get("PORT", "8000"))
 BASE_PATH = os.environ.get("BASE_PATH", "/mcp")
 MAX_ROWS  = int(os.environ.get("MAX_ROWS", "1000"))
 
-# Read-only guard. Reject any SQL containing these tokens (case-insensitive,
-# word-boundary). Coarse, but it stops the obvious things.
 FORBIDDEN_SQL = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|REPLACE|"
     r"ATTACH|DETACH|GRANT|REVOKE|VACUUM|COMMENT|MERGE|CALL|DO)\b",
@@ -68,9 +70,6 @@ def _get_pool() -> ConnectionPool:
 
 
 # ─── MCP server setup ────────────────────────────────────────────
-#
-# host=0.0.0.0 so the container is reachable from the cluster network.
-# streamable_http_path sets the URL path the transport listens on.
 
 mcp = FastMCP(
     "omop-cdm",
@@ -124,7 +123,6 @@ def run_omop_sql(sql: str, purpose: str = "") -> dict[str, Any]:
                 cur.execute(sql_clean)
                 rows = cur.fetchmany(MAX_ROWS)
                 cols = [d.name for d in cur.description] if cur.description else []
-        # Coerce non-JSON-serializable types (dates, Decimal) to strings.
         rows = [
             {k: (v if _json_safe(v) else str(v)) for k, v in r.items()}
             for r in rows
@@ -171,9 +169,7 @@ def lookup_concept(
         limit:  Max concepts to return (default 10, max 50).
 
     Returns:
-        {concepts: [{concept_id, concept_name, domain_id,
-                     vocabulary_id, concept_class_id,
-                     standard_concept}], count}
+        {concepts: [...], count: int}
     """
     limit = max(1, min(int(limit or 10), 50))
     pattern = f"%{term}%"
@@ -217,19 +213,17 @@ def expand_concept_set(
 ) -> dict[str, Any]:
     """
     Return all descendant concepts of a given concept via the OMOP
-    concept_ancestor table. Use this for class-to-ingredient expansion
-    (e.g., 'SGLT2 inhibitors' parent class → individual ingredients) or
-    parent-condition expansion (e.g., 'diabetes mellitus' → all
-    diabetes subtypes).
+    concept_ancestor table. Use for class-to-ingredient expansion (e.g.,
+    'SGLT2 inhibitors' → individual ingredients) or parent-condition
+    expansion (e.g., 'diabetes mellitus' → all subtypes).
 
-    Always call this BEFORE using a parent concept in SQL or a cohort
-    definition — operating on a parent concept directly will miss
-    everything coded at the descendant level.
+    Always call this BEFORE using a parent concept in SQL — operating on
+    a parent concept directly will miss everything coded at the
+    descendant level.
 
     Args:
         concept_id:   The ancestor concept_id to expand from.
-        include_self: If True (default), the ancestor itself is
-                      included in the result.
+        include_self: If True (default), include the ancestor itself.
         max_levels:   Optional cap on hierarchy depth (None = no cap).
 
     Returns:
@@ -269,10 +263,96 @@ def expand_concept_set(
         return {"error": str(e), "concept_id": concept_id}
 
 
+# ─── Tool 4: render_chart ────────────────────────────────────────
+
+# SAS-aligned palette so charts feel native to the demo.
+_PALETTE = ["#0072CE", "#A42548", "#0C6E7A", "#B8620A", "#7B61FF",
+            "#DAB866", "#3CC4CF", "#1A7A45"]
+
+
+@mcp.tool()
+def render_chart(
+    chart_type: Literal["bar", "barh", "line", "pie"],
+    title: str,
+    labels: list[str],
+    values: list[float],
+    x_label: str = "",
+    y_label: str = "",
+) -> Image:
+    """
+    Render a matplotlib chart and return it as an inline image. Use this
+    when the user asks to visualize, plot, compare, or graph data — or
+    when a chart would substantially clarify a result.
+
+    Pass a parallel pair of `labels` and `values` arrays of equal length.
+    For ranked categorical data (top-N conditions, drug counts, cohort
+    sizes), use `barh` — horizontal bars handle long category names
+    cleanly. Use `bar` only when category names are short. Use `line`
+    for ordered/temporal data. Use `pie` only for a small number of
+    parts-of-a-whole categories (≤6).
+
+    Args:
+        chart_type: One of "bar", "barh", "line", "pie".
+        title:      Chart title (shown above the plot).
+        labels:     Category labels (x-axis for bar/line, segment names for pie).
+        values:     Numeric values, parallel to labels.
+        x_label:    Optional x-axis label.
+        y_label:    Optional y-axis label.
+
+    Returns:
+        Inline PNG image rendered for the chat UI.
+    """
+    if len(labels) != len(values):
+        raise ValueError("labels and values must have the same length")
+    if not labels:
+        raise ValueError("labels and values must not be empty")
+
+    fig, ax = plt.subplots(figsize=(7, 4), dpi=110)
+
+    if chart_type == "bar":
+        ax.bar(labels, values, color=_PALETTE[0], edgecolor="none")
+        if x_label: ax.set_xlabel(x_label)
+        if y_label: ax.set_ylabel(y_label)
+        ax.tick_params(axis="x", rotation=30)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        ax.grid(axis="y", alpha=0.25, linewidth=0.6)
+
+    elif chart_type == "barh":
+        # Reverse so largest is on top
+        ax.barh(labels[::-1], values[::-1], color=_PALETTE[0], edgecolor="none")
+        if x_label: ax.set_xlabel(x_label)
+        if y_label: ax.set_ylabel(y_label)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        ax.grid(axis="x", alpha=0.25, linewidth=0.6)
+
+    elif chart_type == "line":
+        ax.plot(labels, values, color=_PALETTE[0], linewidth=2.0, marker="o")
+        if x_label: ax.set_xlabel(x_label)
+        if y_label: ax.set_ylabel(y_label)
+        ax.tick_params(axis="x", rotation=30)
+        for spine in ("top", "right"):
+            ax.spines[spine].set_visible(False)
+        ax.grid(alpha=0.25, linewidth=0.6)
+
+    elif chart_type == "pie":
+        colors = (_PALETTE * ((len(labels) // len(_PALETTE)) + 1))[:len(labels)]
+        ax.pie(values, labels=labels, colors=colors,
+               autopct="%1.1f%%", startangle=90,
+               wedgeprops={"edgecolor": "white", "linewidth": 1})
+        ax.set_aspect("equal")
+
+    ax.set_title(title, fontsize=12, loc="left")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return Image(data=buf.getvalue(), format="png")
+
+
 # ─── Entrypoint ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Streamable HTTP — the modern MCP transport, served at BASE_PATH on PORT.
-    # RAM's Container MCP template (Transport=HTTP, Port=8000, Base Path=/mcp)
-    # connects here.
     mcp.run(transport="streamable-http")
