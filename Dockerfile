@@ -8,9 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install OS-level deps needed for psycopg's binary wheel.
-# (The [binary] extra usually avoids the need for libpq-dev, but we keep
-# ca-certificates around for TLS to Supabase.)
+# OS-level deps. ca-certificates is needed for TLS to Supabase.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
@@ -26,5 +24,7 @@ COPY server.py .
 RUN useradd --create-home --shell /bin/bash mcp
 USER mcp
 
-# MCP servers speak over stdio by default.
+# Streamable HTTP transport listens on this port.
+EXPOSE 8000
+
 CMD ["python", "server.py"]

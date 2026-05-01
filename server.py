@@ -12,15 +12,12 @@ sized small intentionally — RAM agents are short-lived and Supabase's
 transaction pooler does the heavy lifting.
 
 The read-only guard rejects any SQL containing mutation keywords before
-sending it to the database. Defense in depth: we also connect with a
-role that should not have write privileges in the long run; for now the
-guard alone is sufficient.
+sending it to the database.
 
-Speaks MCP over stdio when run as a script (the standard way Container
-MCP servers are consumed).
+Speaks MCP over Streamable HTTP on PORT (default 8000) at BASE_PATH
+(default /mcp). RAM's Container MCP template connects to this endpoint.
 """
 from __future__ import annotations
-import json
 import os
 import re
 import sys
@@ -39,26 +36,17 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     sys.exit("FATAL: DATABASE_URL environment variable is required.")
 
-# Hard row cap on every query. The agent can request a smaller limit but
-# never a larger one. Prevents a runaway LLM from pulling the entire CDM.
-MAX_ROWS = int(os.environ.get("MAX_ROWS", "1000"))
+PORT      = int(os.environ.get("PORT", "8000"))
+BASE_PATH = os.environ.get("BASE_PATH", "/mcp")
+MAX_ROWS  = int(os.environ.get("MAX_ROWS", "1000"))
 
 # Read-only guard. Reject any SQL containing these tokens (case-insensitive,
-# word-boundary). This is a coarse check but it stops the obvious things.
+# word-boundary). Coarse, but it stops the obvious things.
 FORBIDDEN_SQL = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|REPLACE|"
     r"ATTACH|DETACH|GRANT|REVOKE|VACUUM|COMMENT|MERGE|CALL|DO)\b",
     re.IGNORECASE,
 )
-
-# Tables the agent may query. Kept explicit so an unexpected table name in
-# generated SQL fails fast with a clear error rather than a confusing
-# Postgres "relation not found".
-CDM_TABLES = {
-    "person", "observation_period", "visit_occurrence", "condition_occurrence",
-    "drug_exposure", "measurement", "procedure_occurrence", "death",
-    "concept", "concept_ancestor", "concept_relationship", "cdm_source",
-}
 
 
 # ─── Connection pool ─────────────────────────────────────────────
@@ -80,8 +68,16 @@ def _get_pool() -> ConnectionPool:
 
 
 # ─── MCP server setup ────────────────────────────────────────────
+#
+# host=0.0.0.0 so the container is reachable from the cluster network.
+# streamable_http_path sets the URL path the transport listens on.
 
-mcp = FastMCP("omop-cdm")
+mcp = FastMCP(
+    "omop-cdm",
+    host="0.0.0.0",
+    port=PORT,
+    streamable_http_path=BASE_PATH,
+)
 
 
 # ─── Tool 1: run_omop_sql ────────────────────────────────────────
@@ -128,7 +124,7 @@ def run_omop_sql(sql: str, purpose: str = "") -> dict[str, Any]:
                 cur.execute(sql_clean)
                 rows = cur.fetchmany(MAX_ROWS)
                 cols = [d.name for d in cur.description] if cur.description else []
-        # Coerce non-JSON-serializable types (dates, Decimal) to strings
+        # Coerce non-JSON-serializable types (dates, Decimal) to strings.
         rows = [
             {k: (v if _json_safe(v) else str(v)) for k, v in r.items()}
             for r in rows
@@ -276,5 +272,7 @@ def expand_concept_set(
 # ─── Entrypoint ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Speak MCP over stdio. RAM's Container MCP runtime connects this way.
-    mcp.run()
+    # Streamable HTTP — the modern MCP transport, served at BASE_PATH on PORT.
+    # RAM's Container MCP template (Transport=HTTP, Port=8000, Base Path=/mcp)
+    # connects here.
+    mcp.run(transport="streamable-http")
