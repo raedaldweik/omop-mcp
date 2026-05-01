@@ -1,0 +1,19 @@
+# keep the build context tight
+.git
+.github
+.gitignore
+.dockerignore
+.env
+.env.*
+*.md
+README*
+LICENSE*
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
